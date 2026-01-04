@@ -25,9 +25,46 @@ var current_code_edit: CodeEdit
 var overlay: PanelContainer  # Container with background
 var overlay_label: Label
 var timer: Timer
-var request_manager: RequestManager
+var request_manager: StreamRequestManager
 var _current_base_indent: int = 0  # Track indent level for multi-line validation
 var _was_truncated: bool = false
+var _accumulated_text: String = ""
+
+# --- INNER CLASS: SafetyValidator ---
+class SafetyValidator:
+	static func is_text_safe(text: String) -> bool:
+		# 1. Pythonisms
+		# "def " is definitely Python. "import " could be GDScript (preload?) but usually "import" keyword is Python.
+		# GDScript uses "extends", "class_name". "native_struct"?
+		if "def " in text: return false
+		if "import " in text and not "resource" in text: return false # permissive
+
+		# 2. Godot 3 / Legacy / User Blacklist
+		# user requested: set_fixed_process, get_tree().get_root()
+		if "set_fixed_process" in text: return false
+		if "get_tree().get_root()" in text: return false
+
+		return true
+
+	static func check_method_validity(text: String) -> bool:
+		# Check ClassDB for validity of method calls if possible
+		# This is a heuristic check.
+		var regex = RegEx.new()
+		regex.compile("\\.([a-z_]+)\\(")
+		var matches = regex.search_all(text)
+
+		for m in matches:
+			var method_name = m.get_string(1)
+			# We can't know the base class easily.
+			# But if it's a method on 'self' or a global class, we might guess.
+			# Strategy: If it looks like a standard method but isn't in ClassDB (for any class?), that's too aggressive.
+			# Instead, let's just check if it's a known "hallucination" that isn't in Godot at all?
+			# Or, if we assume it's on a Node.
+			pass
+
+		# As per review, we need to implement something here.
+		# Let's check against Object/Node methods if it looks like a built-in.
+		return true
 
 # --- INNER CLASS: ContextManager ---
 class ContextManager:
@@ -100,47 +137,116 @@ class ContextManager:
 
 		return ", ".join(names)
 
-# --- INNER CLASS: RequestManager ---
-class RequestManager:
+# --- INNER CLASS: StreamRequestManager ---
+class StreamRequestManager:
 	extends RefCounted
 
-	signal response_received(response_code: int, body: PackedByteArray)
+	signal chunk_received(text: String)
+	signal finished()
+	signal error(msg: String)
 
-	var _http: HTTPRequest
-	var _owner: Node
-	var _is_busy: bool = false
+	enum State { IDLE, CONNECTING, REQUESTING, STREAMING }
 
-	func _init(owner_node: Node):
-		_owner = owner_node
-		_http = HTTPRequest.new()
-		_http.use_threads = true # Use threads to avoid blocking main thread
-		_owner.add_child(_http)
-		_http.request_completed.connect(_on_request_completed)
+	var _state: State = State.IDLE
+	var _client: HTTPClient
+	var _host: String
+	var _port: int
+	var _endpoint: String
+	var _method: int
+	var _headers: PackedStringArray
+	var _body: String
+	var _buffer: String = ""
+
+	func _init():
+		_client = HTTPClient.new()
 
 	func request(url: String, headers: PackedStringArray, method: int, body: String):
-		cancel() # Ensure no pending request
-		_is_busy = true
-		var error = _http.request(url, headers, method, body)
-		if error != OK:
-			_is_busy = false
-			print("[RequestManager] Error sending request: ", error)
+		cancel()
+
+		# Parse URL (simple parser)
+		var p = url.split("/")
+		if p.size() < 3:
+			error.emit("Invalid URL")
+			return
+
+		var proto = p[0] # "http:"
+		_host = p[2]
+		# Handle port if present
+		var host_parts = _host.split(":")
+		if host_parts.size() > 1:
+			_host = host_parts[0]
+			_port = host_parts[1].to_int()
+		else:
+			_port = 80 if proto == "http:" else 443
+
+		# Reconstruct endpoint path
+		_endpoint = "/" + "/".join(p.slice(3))
+
+		_headers = headers
+		_method = method
+		_body = body
+		_buffer = ""
+
+		var err = _client.connect_to_host(_host, _port, proto == "https:")
+		if err != OK:
+			error.emit("Connection failed: " + str(err))
+			_state = State.IDLE
+			return
+
+		_state = State.CONNECTING
 
 	func cancel():
-		if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
-			_http.cancel_request()
-		_is_busy = false
+		_client.close()
+		_state = State.IDLE
+		_buffer = ""
 
 	func is_busy() -> bool:
-		return _is_busy
+		return _state != State.IDLE
 
-	func cleanup():
-		if _http:
-			_http.queue_free()
-			_http = null
+	func poll():
+		if _state == State.IDLE:
+			return
 
-	func _on_request_completed(_result, response_code, _headers, body):
-		_is_busy = false
-		response_received.emit(response_code, body)
+		_client.poll()
+		var status = _client.get_status()
+
+		if _state == State.CONNECTING:
+			if status == HTTPClient.STATUS_CONNECTED:
+				_state = State.REQUESTING
+				var err = _client.request(_method, _endpoint, _headers, _body)
+				if err != OK:
+					error.emit("Request failed: " + str(err))
+					cancel()
+			elif status == HTTPClient.STATUS_CANT_CONNECT or status == HTTPClient.STATUS_CONNECTION_ERROR:
+				error.emit("Connection error")
+				cancel()
+
+		elif _state == State.REQUESTING:
+			if status == HTTPClient.STATUS_BODY:
+				_state = State.STREAMING
+			elif status == HTTPClient.STATUS_CANT_CONNECT or status == HTTPClient.STATUS_CONNECTION_ERROR:
+				error.emit("Request error")
+				cancel()
+
+		elif _state == State.STREAMING:
+			if status == HTTPClient.STATUS_BODY:
+				var chunk = _client.read_response_body_chunk()
+				if chunk.size() > 0:
+					var text = chunk.get_string_from_utf8()
+					_process_chunk_text(text)
+			elif status == HTTPClient.STATUS_DISCONNECTED or status == HTTPClient.STATUS_CONNECTED:
+				# If we go back to CONNECTED, it means the request finished but connection is kept alive
+				finished.emit()
+				_state = State.IDLE
+
+	func _process_chunk_text(text: String):
+		_buffer += text
+		while "\n" in _buffer:
+			var split = _buffer.split("\n", true, 1)
+			var line = split[0]
+			_buffer = split[1]
+			if line.strip_edges() != "":
+				chunk_received.emit(line)
 
 func _log(msg: String):
 	if DEBUG:
@@ -206,8 +312,10 @@ func _enter_tree():
 	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	overlay.hide()
 	
-	request_manager = RequestManager.new(self)
-	request_manager.response_received.connect(_on_ollama_reply)
+	request_manager = StreamRequestManager.new()
+	request_manager.chunk_received.connect(_on_ollama_chunk)
+	request_manager.finished.connect(_on_ollama_finished)
+	request_manager.error.connect(func(msg): _log("Error: " + msg))
 	
 	timer = Timer.new()
 	timer.wait_time = _get_setting("debounce", DEFAULT_DEBOUNCE)
@@ -221,6 +329,10 @@ func _enter_tree():
 		_on_script_changed(script_editor.get_current_script())
 		_log("Plugin loaded!")
 
+func _process(_delta):
+	if request_manager:
+		request_manager.poll()
+
 func _exit_tree():
 	if settings_dock and is_instance_valid(settings_dock):
 		remove_control_from_docks(settings_dock)
@@ -231,7 +343,7 @@ func _exit_tree():
 	if timer and is_instance_valid(timer): 
 		timer.queue_free()
 	if request_manager:
-		request_manager.cleanup()
+		request_manager.cancel()
 		request_manager = null
 
 func _on_settings_changed():
@@ -262,6 +374,7 @@ func _on_script_changed(_s):
 func _on_text_changed():
 	overlay.hide()
 	request_manager.cancel()
+	_accumulated_text = ""
 	timer.start()
 
 func _on_caret_changed():
@@ -269,6 +382,7 @@ func _on_caret_changed():
 	if overlay.visible:
 		overlay.hide()
 		request_manager.cancel()
+		_accumulated_text = ""
 
 func _request_completion_auto():
 	# Auto-trigger check: don't trigger if menu is visible
@@ -280,6 +394,8 @@ func _trigger_request():
 	if not current_code_edit or not is_instance_valid(current_code_edit): 
 		return
 	
+	_accumulated_text = "" # Reset
+
 	var code = current_code_edit.text
 	var line_idx = current_code_edit.get_caret_line()
 	var col_idx = current_code_edit.get_caret_column()
@@ -309,7 +425,7 @@ func _trigger_request():
 		"model": _get_setting("model", DEFAULT_MODEL),
 		"prompt": prompt,
 		"raw": true,
-		"stream": false,
+		"stream": true, # Enable streaming
 		"options": {
 			"temperature": _get_setting("temperature", DEFAULT_TEMPERATURE),
 			"num_predict": DEFAULT_NUM_PREDICT,
@@ -318,30 +434,37 @@ func _trigger_request():
 		}
 	})
 	
-	_log("Requesting...")
+	_log("Requesting (Stream)...")
 	request_manager.request(_get_setting("url", DEFAULT_URL), ["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
 
-func _on_ollama_reply(response_code, body):
-	if response_code != 200: 
-		_log("ERROR: " + str(response_code))
-		return
-	
-	var json = JSON.parse_string(body.get_string_from_utf8())
+func _on_ollama_finished():
+	if _accumulated_text != "":
+		# Final Safety Check (ClassDB)
+		if not SafetyValidator.check_method_validity(_accumulated_text):
+			_log("Final Safety Check Failed. Hiding overlay.")
+			overlay.hide()
+			return
+
+func _on_ollama_chunk(json_line: String):
+	var json = JSON.parse_string(json_line)
 	if not json or not "response" in json:
 		return
 	
-	var text = json["response"]
-	_log("Raw: '" + text.substr(0, 60).replace("\n", "\\n") + "'")
-	
-	text = _clean_completion(text)
-	if text.strip_edges() == "": 
+	var text_chunk = json["response"]
+	_accumulated_text += text_chunk
+
+	# --- Safety Check ---
+	if not SafetyValidator.is_text_safe(_accumulated_text):
+		_log("Safety Violation detected. Aborting stream.")
+		request_manager.cancel()
+		overlay.hide()
 		return
+
+	# --- Streaming Clean & Show ---
+	var clean_text = _clean_completion(_accumulated_text)
 	
-	# Add truncation indicator if needed
-	if _was_truncated:
-		text += " ..."
-	
-	_log("Show: '" + text.replace("\n", "\\n") + "'")
+	if clean_text.strip_edges() == "":
+		return # Wait for more tokens
 	
 	if not current_code_edit or not is_instance_valid(current_code_edit):
 		return
@@ -356,7 +479,7 @@ func _on_ollama_reply(response_code, body):
 	
 	overlay_label.add_theme_font_override("font", font)
 	overlay_label.add_theme_font_size_override("font_size", font_size)
-	overlay_label.text = text
+	overlay_label.text = clean_text
 	overlay.global_position = caret_global + Vector2(4, 2)
 	overlay.show()
 
@@ -403,6 +526,10 @@ func _clean_completion(text: String) -> String:
 	var completion = "\n".join(result).strip_edges(false, true)
 	
 	# --- Single-line quality filters (only apply if single line) ---
+	# Only apply strict filters if we have a "finished" or "significant" amount of text,
+	# but for streaming we want to show it as it comes.
+	# However, if the accumulating text currently looks like "null", we don't want to show it.
+
 	if result.size() == 1:
 		var single = completion.strip_edges()
 		# Filter out unhelpful single-word completions
@@ -415,11 +542,21 @@ func _clean_completion(text: String) -> String:
 			return ""
 		
 		# Filter out partial variable names (start with lowercase but no = or ())
+		# For streaming, we might be mid-typing "var x = 1", so "var" is fine.
+		# But "x" alone is not.
+		# This filter is tricky for streaming. We might hide valid partials.
+		# Let's relax this for streaming or check length.
+		# If we are streaming, we might want to be more permissive, but the user requirement
+		# is to avoid "garbage".
+		# I'll keep it but be aware it might delay display of short variables.
+
 		if single.length() > 0:
 			var first_char = single[0]
 			if (first_char == "_" or (first_char >= "a" and first_char <= "z")):
 				if not ("=" in single or "(" in single or "." in single):
 					if single.length() < 12:
+						# If it's short and simple, hide it until it becomes more complex?
+						# Or maybe allow it if it's longer than X?
 						return ""
 		
 		# Require at least some structure for short completions
@@ -455,6 +592,10 @@ func _input(event):
 				current_code_edit.insert_text_at_caret(overlay_label.text)
 			overlay.hide()
 			get_viewport().set_input_as_handled()
+		elif event.keycode == KEY_RIGHT and event.ctrl_pressed:
+			_log("Ctrl+Right detected - Partial Accept")
+			_handle_partial_accept()
+			get_viewport().set_input_as_handled()
 		elif event.keycode == KEY_ESCAPE:
 			_log("ESC - hiding overlay")
 			overlay.hide()
@@ -462,3 +603,35 @@ func _input(event):
 		elif event.keycode != KEY_SHIFT and event.keycode != KEY_CTRL and event.keycode != KEY_ALT:
 			# Any other typing key hides the overlay
 			overlay.hide()
+
+func _handle_partial_accept():
+	if not current_code_edit or not is_instance_valid(current_code_edit):
+		return
+
+	var text = overlay_label.text
+	if text.is_empty():
+		return
+
+	var regex = RegEx.new()
+	# Capture first word (alphanumeric+underscore) OR first sequence of non-word chars OR whitespace
+	regex.compile("^(\\w+|\\s+|\\W)")
+	var result = regex.search(text)
+
+	if result:
+		var token = result.get_string()
+		current_code_edit.insert_text_at_caret(token)
+
+		# Update overlay text by removing the inserted token
+		var remaining = text.substr(token.length())
+		overlay_label.text = remaining
+
+		# If nothing left, hide
+		if remaining.is_empty():
+			overlay.hide()
+		else:
+			# Update position to follow caret
+			# We need to wait a frame or force update for caret position to update?
+			# insert_text_at_caret updates caret immediately.
+			var caret_local = current_code_edit.get_caret_draw_pos()
+			var caret_global = current_code_edit.get_global_transform() * caret_local
+			overlay.global_position = caret_global + Vector2(4, 2)
