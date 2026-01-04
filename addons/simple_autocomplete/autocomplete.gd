@@ -1,20 +1,15 @@
 @tool
 extends EditorPlugin
 
-# --- CONFIG (Now uses ProjectSettings) ---
-const SETTING_PREFIX = "addons/simple_autocomplete/"
+# --- IMPORTS ---
+const Constants = preload("res://addons/simple_autocomplete/constants.gd")
+
+# --- CONFIG ---
 const DEBUG = true
 
-# Defaults
-const DEFAULT_URL = "http://localhost:11434/api/generate"
-const DEFAULT_MODEL = "qwen2.5-coder:1.5b"
-const DEFAULT_DEBOUNCE = 0.4
-const DEFAULT_MAX_LINES = 4
-const DEFAULT_NUM_PREDICT = 128
-const DEFAULT_TEMPERATURE = 0.1
-const DEFAULT_NUM_CTX = 4096
-
-const SYSTEM_PROMPT = "You are a Godot 4.5 GDScript expert. Prioritize typed GDScript, signal-based architecture, and composition. Output only the code completion."
+# Convenience aliases from Constants
+var SETTING_PREFIX: String:
+	get: return Constants.SETTING_PREFIX
 
 # --- DOCK ---
 const SettingsDockScript = preload("res://addons/simple_autocomplete/settings_dock.gd")
@@ -32,38 +27,52 @@ var _accumulated_text: String = ""
 
 # --- INNER CLASS: SafetyValidator ---
 class SafetyValidator:
+	# Common base classes to check methods against
+	const CHECK_CLASSES = ["Object", "Node", "Node2D", "Node3D", "Control", "CanvasItem", "Resource"]
+	
 	static func is_text_safe(text: String) -> bool:
 		# 1. Pythonisms
-		# "def " is definitely Python. "import " could be GDScript (preload?) but usually "import" keyword is Python.
-		# GDScript uses "extends", "class_name". "native_struct"?
 		if "def " in text: return false
-		if "import " in text and not "resource" in text: return false # permissive
-
-		# 2. Godot 3 / Legacy / User Blacklist
-		# user requested: set_fixed_process, get_tree().get_root()
-		if "set_fixed_process" in text: return false
-		if "get_tree().get_root()" in text: return false
-
+		if "import " in text and not "resource" in text: return false
+		
+		# 2. Check deprecated patterns from constants
+		if Constants.is_deprecated_pattern(text):
+			return false
+		
 		return true
 
 	static func check_method_validity(text: String) -> bool:
-		# Check ClassDB for validity of method calls if possible
-		# This is a heuristic check.
+		# Extract method calls that look like Godot API calls
 		var regex = RegEx.new()
-		regex.compile("\\.([a-z_]+)\\(")
+		# Match: self.method( or .method( patterns (lowercase methods typical of Godot API)
+		regex.compile("(?:self|\\$[\\w/]+|get_node\\([^)]+\\))\\.([a-z_][a-z0-9_]*)\\(")
 		var matches = regex.search_all(text)
-
+		
 		for m in matches:
 			var method_name = m.get_string(1)
-			# We can't know the base class easily.
-			# But if it's a method on 'self' or a global class, we might guess.
-			# Strategy: If it looks like a standard method but isn't in ClassDB (for any class?), that's too aggressive.
-			# Instead, let's just check if it's a known "hallucination" that isn't in Godot at all?
-			# Or, if we assume it's on a Node.
-			pass
-
-		# As per review, we need to implement something here.
-		# Let's check against Object/Node methods if it looks like a built-in.
+			
+			# Skip common user-defined patterns (signals, private methods)
+			if method_name.begins_with("_") and not method_name.begins_with("_on_"):
+				continue  # Likely user-defined
+			if method_name.begins_with("on_"):
+				continue  # Likely user-defined signal handler
+			
+			# Check if method exists in any common base class
+			var found = false
+			for cls_name in CHECK_CLASSES:
+				if ClassDB.class_has_method(cls_name, method_name):
+					found = true
+					break
+			
+			# If it looks like a standard API call but isn't found, flag it
+			# Only flag methods that look like Godot naming convention (snake_case, common prefixes)
+			if not found:
+				var godot_prefixes = ["get_", "set_", "is_", "has_", "can_", "add_", "remove_", "emit_"]
+				for prefix in godot_prefixes:
+					if method_name.begins_with(prefix):
+						# This looks like a Godot method but doesn't exist - likely hallucinated
+						return false
+		
 		return true
 
 # --- INNER CLASS: ContextManager ---
@@ -156,40 +165,47 @@ class StreamRequestManager:
 	var _headers: PackedStringArray
 	var _body: String
 	var _buffer: String = ""
+	var _timeout_sec: float = Constants.DEFAULT_TIMEOUT
+	var _elapsed_time: float = 0.0
 
 	func _init():
 		_client = HTTPClient.new()
 
 	func request(url: String, headers: PackedStringArray, method: int, body: String):
 		cancel()
-
-		# Parse URL (simple parser)
-		var p = url.split("/")
-		if p.size() < 3:
-			error.emit("Invalid URL")
+		
+		# Robust URL parsing with regex
+		var url_regex = RegEx.new()
+		# Matches: http(s)://host(:port)/path(?query)
+		url_regex.compile("^(https?)://([^/:]+):?(\\d*)(/.*)$")
+		var result = url_regex.search(url)
+		
+		if not result:
+			error.emit("Invalid URL format: " + url)
 			return
-
-		var proto = p[0] # "http:"
-		_host = p[2]
-		# Handle port if present
-		var host_parts = _host.split(":")
-		if host_parts.size() > 1:
-			_host = host_parts[0]
-			_port = host_parts[1].to_int()
+		
+		var proto = result.get_string(1)  # "http" or "https"
+		_host = result.get_string(2)
+		var port_str = result.get_string(3)
+		_endpoint = result.get_string(4) if result.get_string(4) else "/"
+		
+		# Parse port
+		if port_str != "":
+			_port = port_str.to_int()
 		else:
-			_port = 80 if proto == "http:" else 443
-
-		# Reconstruct endpoint path
-		_endpoint = "/" + "/".join(p.slice(3))
+			_port = 443 if proto == "https" else 80
 
 		_headers = headers
 		_method = method
 		_body = body
 		_buffer = ""
+		_elapsed_time = 0.0
 
-		var err = _client.connect_to_host(_host, _port, proto == "https:")
+		# For HTTPS, pass TLSOptions; for HTTP, pass -1 for port auto-detection
+		var tls_options = TLSOptions.client() if proto == "https" else null
+		var err = _client.connect_to_host(_host, _port, tls_options)
 		if err != OK:
-			error.emit("Connection failed: " + str(err))
+			error.emit("Connection failed to " + _host + ":" + str(_port) + " - Error: " + str(err))
 			_state = State.IDLE
 			return
 
@@ -199,14 +215,22 @@ class StreamRequestManager:
 		_client.close()
 		_state = State.IDLE
 		_buffer = ""
+		_elapsed_time = 0.0
 
 	func is_busy() -> bool:
 		return _state != State.IDLE
-
-	func poll():
+	
+	func poll_with_delta(delta: float):
 		if _state == State.IDLE:
 			return
-
+		
+		# Track timeout
+		_elapsed_time += delta
+		if _elapsed_time > _timeout_sec:
+			error.emit("Request timed out after " + str(_timeout_sec) + " seconds")
+			cancel()
+			return
+		
 		_client.poll()
 		var status = _client.get_status()
 
@@ -218,12 +242,13 @@ class StreamRequestManager:
 					error.emit("Request failed: " + str(err))
 					cancel()
 			elif status == HTTPClient.STATUS_CANT_CONNECT or status == HTTPClient.STATUS_CONNECTION_ERROR:
-				error.emit("Connection error")
+				error.emit("Connection error to " + _host)
 				cancel()
 
 		elif _state == State.REQUESTING:
 			if status == HTTPClient.STATUS_BODY:
 				_state = State.STREAMING
+				_elapsed_time = 0.0  # Reset timeout for streaming phase
 			elif status == HTTPClient.STATUS_CANT_CONNECT or status == HTTPClient.STATUS_CONNECTION_ERROR:
 				error.emit("Request error")
 				cancel()
@@ -234,6 +259,7 @@ class StreamRequestManager:
 				if chunk.size() > 0:
 					var text = chunk.get_string_from_utf8()
 					_process_chunk_text(text)
+					_elapsed_time = 0.0  # Reset timeout on each chunk
 			elif status == HTTPClient.STATUS_DISCONNECTED or status == HTTPClient.STATUS_CONNECTED:
 				# If we go back to CONNECTED, it means the request finished but connection is kept alive
 				finished.emit()
@@ -255,10 +281,10 @@ func _log(msg: String):
 # --- SETTINGS HELPERS ---
 func _init_settings():
 	var settings = {
-		"url": DEFAULT_URL,
-		"model": DEFAULT_MODEL,
-		"debounce": DEFAULT_DEBOUNCE,
-		"max_lines": DEFAULT_MAX_LINES,
+		"url": Constants.DEFAULT_URL,
+		"model": Constants.DEFAULT_MODEL,
+		"debounce": Constants.DEFAULT_DEBOUNCE,
+		"max_lines": Constants.DEFAULT_MAX_LINES,
 	}
 	var added_new = false
 	for key in settings.keys():
@@ -318,7 +344,7 @@ func _enter_tree():
 	request_manager.error.connect(func(msg): _log("Error: " + msg))
 	
 	timer = Timer.new()
-	timer.wait_time = _get_setting("debounce", DEFAULT_DEBOUNCE)
+	timer.wait_time = _get_setting("debounce", Constants.DEFAULT_DEBOUNCE)
 	timer.one_shot = true
 	timer.timeout.connect(_request_completion_auto)
 	add_child(timer)
@@ -329,9 +355,9 @@ func _enter_tree():
 		_on_script_changed(script_editor.get_current_script())
 		_log("Plugin loaded!")
 
-func _process(_delta):
+func _process(delta):
 	if request_manager:
-		request_manager.poll()
+		request_manager.poll_with_delta(delta)
 
 func _exit_tree():
 	if settings_dock and is_instance_valid(settings_dock):
@@ -348,7 +374,7 @@ func _exit_tree():
 
 func _on_settings_changed():
 	# Update timer with new debounce value
-	timer.wait_time = _get_setting("debounce", DEFAULT_DEBOUNCE)
+	timer.wait_time = _get_setting("debounce", Constants.DEFAULT_DEBOUNCE)
 	_log("Settings updated, debounce: " + str(timer.wait_time))
 
 func _on_script_changed(_s):
@@ -416,26 +442,32 @@ func _trigger_request():
 
 	# Context Injection
 	var context = ContextManager.get_context(EditorInterface.get_edited_scene_root())
+	
+	# Get model name and determine FIM format
+	var model_name = _get_setting("model", Constants.DEFAULT_MODEL)
+	var fim_format = Constants.get_fim_format_for_model(model_name)
+	var fim_prefix = fim_format[0]
+	var fim_suffix = fim_format[1]
+	var fim_middle = fim_format[2]
 
-	# Pre-Prefix Context: System Prompt + FIM
-	# Inject context at the start of the prefix block
-	var prompt = SYSTEM_PROMPT + "\n" + "<|fim_prefix|>" + context + prefix + "<|fim_suffix|>" + suffix + "<|fim_middle|>"
+	# Build prompt with dynamic FIM tokens
+	var prompt = Constants.SYSTEM_PROMPT + "\n" + fim_prefix + context + prefix + fim_suffix + suffix + fim_middle
 	
 	var body = JSON.stringify({
-		"model": _get_setting("model", DEFAULT_MODEL),
+		"model": model_name,
 		"prompt": prompt,
 		"raw": true,
 		"stream": true, # Enable streaming
 		"options": {
-			"temperature": _get_setting("temperature", DEFAULT_TEMPERATURE),
-			"num_predict": DEFAULT_NUM_PREDICT,
-			"num_ctx": _get_setting("num_ctx", DEFAULT_NUM_CTX),
+			"temperature": _get_setting("temperature", Constants.DEFAULT_TEMPERATURE),
+			"num_predict": Constants.DEFAULT_NUM_PREDICT,
+			"num_ctx": _get_setting("num_ctx", Constants.DEFAULT_NUM_CTX),
 			"stop": ["<|file_separator|>", "\n\n", "\nfunc ", "\nclass ", "\n#", "```"]
 		}
 	})
 	
-	_log("Requesting (Stream)...")
-	request_manager.request(_get_setting("url", DEFAULT_URL), ["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
+	_log("Requesting (Stream) with model: " + model_name + ", FIM format: " + fim_prefix.substr(0, 10) + "...")
+	request_manager.request(_get_setting("url", Constants.DEFAULT_URL), ["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
 
 func _on_ollama_finished():
 	if _accumulated_text != "":
@@ -485,7 +517,7 @@ func _on_ollama_chunk(json_line: String):
 
 func _clean_completion(text: String) -> String:
 	_was_truncated = false
-	var max_lines = _get_setting("max_lines", DEFAULT_MAX_LINES)
+	var max_lines = _get_setting("max_lines", Constants.DEFAULT_MAX_LINES)
 	var lines = text.split("\n")
 	var result = []
 	

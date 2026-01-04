@@ -7,8 +7,14 @@ class_name SettingsDock
 
 signal settings_changed
 
+# --- IMPORTS ---
+const Constants = preload("res://addons/simple_autocomplete/constants.gd")
+
 # --- CONSTANTS ---
-const SETTING_PREFIX = "addons/simple_autocomplete/"
+# Use shared constants from Constants module
+var SETTING_PREFIX: String:
+	get: return Constants.SETTING_PREFIX
+
 const CONTEXT_OPTIONS = {
 	"2K (2048)": 2048,
 	"4K (4096)": 4096,
