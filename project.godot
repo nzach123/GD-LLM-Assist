@@ -8,6 +8,13 @@
 
 config_version=5
 
+[addons]
+
+simple_autocomplete/url="http://localhost:11434/api/generate"
+simple_autocomplete/model="qwen2.5-coder:1.5b"
+simple_autocomplete/debounce=0.4
+simple_autocomplete/max_lines=4
+
 [application]
 
 config/name="GD-LLM-Assist"
