@@ -29,6 +29,77 @@ var request_manager: RequestManager
 var _current_base_indent: int = 0  # Track indent level for multi-line validation
 var _was_truncated: bool = false
 
+# --- INNER CLASS: ContextManager ---
+class ContextManager:
+	static func get_context(root: Node) -> String:
+		var parts = []
+
+		# Scene Tree
+		var tree_str = _get_flattened_scene_tree(root)
+		if tree_str:
+			parts.append("# Scene Tree:\n# " + tree_str.replace("\n", "\n# "))
+
+		# Global Classes
+		var class_str = _get_global_classes()
+		if class_str:
+			parts.append("# Global Classes: " + class_str)
+
+		if parts.is_empty():
+			return ""
+
+		return "# Context:\n" + "\n".join(parts) + "\n\n"
+
+	static func _get_flattened_scene_tree(root: Node) -> String:
+		if not root:
+			return ""
+
+		var lines = []
+		var stack = [{"node": root, "path": root.name}]
+		var count = 0
+		var MAX_NODES = 50
+
+		while stack.size() > 0:
+			var item = stack.pop_back()
+			var node = item["node"]
+			var path = item["path"]
+
+			var type_name = node.get_class()
+			var script = node.get_script() as Script
+			if script:
+				var global_name = script.get_global_name()
+				if global_name != "":
+					type_name = global_name
+
+			lines.append(path + " (" + type_name + ")")
+
+			count += 1
+			if count >= MAX_NODES:
+				lines.append("... (truncated)")
+				break
+
+			var children = node.get_children()
+			for i in range(children.size() - 1, -1, -1):
+				var child = children[i]
+				stack.push_back({"node": child, "path": path + "/" + child.name})
+
+		return "\n".join(lines)
+
+	static func _get_global_classes() -> String:
+		var classes = ProjectSettings.get_global_class_list()
+		if classes.is_empty():
+			return ""
+
+		var names = []
+		for c in classes:
+			names.append(c["class"])
+
+		names.sort()
+		if names.size() > 50:
+			names = names.slice(0, 50)
+			names.append("...")
+
+		return ", ".join(names)
+
 # --- INNER CLASS: RequestManager ---
 class RequestManager:
 	extends RefCounted
@@ -227,8 +298,12 @@ func _trigger_request():
 	var prefix = "\n".join(lines.slice(start, line_idx)) + "\n" + prefix_part
 	var suffix = suffix_part + "\n" + "\n".join(lines.slice(line_idx + 1, end))
 
+	# Context Injection
+	var context = ContextManager.get_context(EditorInterface.get_edited_scene_root())
+
 	# Pre-Prefix Context: System Prompt + FIM
-	var prompt = SYSTEM_PROMPT + "\n" + "<|fim_prefix|>" + prefix + "<|fim_suffix|>" + suffix + "<|fim_middle|>"
+	# Inject context at the start of the prefix block
+	var prompt = SYSTEM_PROMPT + "\n" + "<|fim_prefix|>" + context + prefix + "<|fim_suffix|>" + suffix + "<|fim_middle|>"
 	
 	var body = JSON.stringify({
 		"model": _get_setting("model", DEFAULT_MODEL),
