@@ -14,6 +14,8 @@ const DEFAULT_NUM_PREDICT = 128
 const DEFAULT_TEMPERATURE = 0.1
 const DEFAULT_NUM_CTX = 4096
 
+const SYSTEM_PROMPT = "You are a Godot 4.5 GDScript expert. Prioritize typed GDScript, signal-based architecture, and composition. Output only the code completion."
+
 # --- DOCK ---
 const SettingsDockScript = preload("res://addons/simple_autocomplete/settings_dock.gd")
 var settings_dock: Control
@@ -23,9 +25,51 @@ var current_code_edit: CodeEdit
 var overlay: PanelContainer  # Container with background
 var overlay_label: Label
 var timer: Timer
-var http: HTTPRequest
+var request_manager: RequestManager
 var _current_base_indent: int = 0  # Track indent level for multi-line validation
 var _was_truncated: bool = false
+
+# --- INNER CLASS: RequestManager ---
+class RequestManager:
+	extends RefCounted
+
+	signal response_received(response_code: int, body: PackedByteArray)
+
+	var _http: HTTPRequest
+	var _owner: Node
+	var _is_busy: bool = false
+
+	func _init(owner_node: Node):
+		_owner = owner_node
+		_http = HTTPRequest.new()
+		_http.use_threads = true # Use threads to avoid blocking main thread
+		_owner.add_child(_http)
+		_http.request_completed.connect(_on_request_completed)
+
+	func request(url: String, headers: PackedStringArray, method: int, body: String):
+		cancel() # Ensure no pending request
+		_is_busy = true
+		var error = _http.request(url, headers, method, body)
+		if error != OK:
+			_is_busy = false
+			print("[RequestManager] Error sending request: ", error)
+
+	func cancel():
+		if _http.get_http_client_status() != HTTPClient.STATUS_DISCONNECTED:
+			_http.cancel_request()
+		_is_busy = false
+
+	func is_busy() -> bool:
+		return _is_busy
+
+	func cleanup():
+		if _http:
+			_http.queue_free()
+			_http = null
+
+	func _on_request_completed(_result, response_code, _headers, body):
+		_is_busy = false
+		response_received.emit(response_code, body)
 
 func _log(msg: String):
 	if DEBUG:
@@ -91,14 +135,13 @@ func _enter_tree():
 	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	overlay.hide()
 	
-	http = HTTPRequest.new()
-	http.request_completed.connect(_on_ollama_reply)
-	add_child(http)
+	request_manager = RequestManager.new(self)
+	request_manager.response_received.connect(_on_ollama_reply)
 	
 	timer = Timer.new()
 	timer.wait_time = _get_setting("debounce", DEFAULT_DEBOUNCE)
 	timer.one_shot = true
-	timer.timeout.connect(_request_completion)
+	timer.timeout.connect(_request_completion_auto)
 	add_child(timer)
 	
 	var script_editor = EditorInterface.get_script_editor()
@@ -116,8 +159,9 @@ func _exit_tree():
 		overlay.queue_free()
 	if timer and is_instance_valid(timer): 
 		timer.queue_free()
-	if http and is_instance_valid(http): 
-		http.queue_free()
+	if request_manager:
+		request_manager.cleanup()
+		request_manager = null
 
 func _on_settings_changed():
 	# Update timer with new debounce value
@@ -131,11 +175,14 @@ func _on_script_changed(_s):
 	if current_code_edit and is_instance_valid(current_code_edit):
 		if current_code_edit.text_changed.is_connected(_on_text_changed):
 			current_code_edit.text_changed.disconnect(_on_text_changed)
+		if current_code_edit.caret_changed.is_connected(_on_caret_changed):
+			current_code_edit.caret_changed.disconnect(_on_caret_changed)
 			
 	if current_editor:
 		current_code_edit = current_editor.get_base_editor()
 		if current_code_edit:
 			current_code_edit.text_changed.connect(_on_text_changed)
+			current_code_edit.caret_changed.connect(_on_caret_changed)
 			if overlay.get_parent(): 
 				overlay.get_parent().remove_child(overlay)
 			current_code_edit.add_child(overlay)
@@ -143,10 +190,22 @@ func _on_script_changed(_s):
 
 func _on_text_changed():
 	overlay.hide()
-	http.cancel_request()
+	request_manager.cancel()
 	timer.start()
 
-func _request_completion():
+func _on_caret_changed():
+	# Hide overlay when moving cursor without typing
+	if overlay.visible:
+		overlay.hide()
+		request_manager.cancel()
+
+func _request_completion_auto():
+	# Auto-trigger check: don't trigger if menu is visible
+	if current_code_edit and current_code_edit.is_menu_visible():
+		return
+	_trigger_request()
+
+func _trigger_request():
 	if not current_code_edit or not is_instance_valid(current_code_edit): 
 		return
 	
@@ -167,7 +226,9 @@ func _request_completion():
 	
 	var prefix = "\n".join(lines.slice(start, line_idx)) + "\n" + prefix_part
 	var suffix = suffix_part + "\n" + "\n".join(lines.slice(line_idx + 1, end))
-	var prompt = "<|fim_prefix|>" + prefix + "<|fim_suffix|>" + suffix + "<|fim_middle|>"
+
+	# Pre-Prefix Context: System Prompt + FIM
+	var prompt = SYSTEM_PROMPT + "\n" + "<|fim_prefix|>" + prefix + "<|fim_suffix|>" + suffix + "<|fim_middle|>"
 	
 	var body = JSON.stringify({
 		"model": _get_setting("model", DEFAULT_MODEL),
@@ -178,14 +239,14 @@ func _request_completion():
 			"temperature": _get_setting("temperature", DEFAULT_TEMPERATURE),
 			"num_predict": DEFAULT_NUM_PREDICT,
 			"num_ctx": _get_setting("num_ctx", DEFAULT_NUM_CTX),
-			"stop": ["<|file_separator|>", "\n\n"]
+			"stop": ["<|file_separator|>", "\n\n", "\nfunc ", "\nclass ", "\n#", "```"]
 		}
 	})
 	
 	_log("Requesting...")
-	http.request(_get_setting("url", DEFAULT_URL), ["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
+	request_manager.request(_get_setting("url", DEFAULT_URL), ["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
 
-func _on_ollama_reply(_res, response_code, _headers, body):
+func _on_ollama_reply(response_code, body):
 	if response_code != 200: 
 		_log("ERROR: " + str(response_code))
 		return
@@ -293,7 +354,20 @@ func _clean_completion(text: String) -> String:
 	return completion
 
 func _input(event):
-	# Only process if overlay is showing
+	# Handle manual trigger
+	if event is InputEventKey and event.pressed:
+		if event.keycode == KEY_SPACE and event.ctrl_pressed:
+			if current_code_edit and is_instance_valid(current_code_edit) and current_code_edit.has_focus():
+				# Don't hijack if native menu is already doing something
+				if not current_code_edit.is_menu_visible():
+					_log("Ctrl+Space detected - Force Trigger")
+					if timer:
+						timer.stop()
+					_trigger_request()
+					get_viewport().set_input_as_handled()
+					return
+
+	# Only process further input if overlay is showing
 	if not overlay or not overlay.visible: 
 		return
 	
